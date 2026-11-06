@@ -201,6 +201,40 @@ def _resize_center_crop(frames: torch.Tensor, height: int, width: int) -> torch.
     return frames[:, :, top : top + height, left : left + width]
 
 
+def _fit_and_pad_action_frames(
+    frames: torch.Tensor, height: int, width: int
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """The official action-mode input of uint8 ``[T, 3, H, W]`` frames on a canvas.
+
+    Fits the frames inside ``height x width`` without upscaling (bicubic,
+    antialiased, rounded to uint8), then pads bottom/right by reflection (edge
+    when the pad is wider than the content). Returns float pixels and the content
+    ``(h, w)``, whose latent grid is the one the model denoises.
+    """
+    orig_h, orig_w = frames.shape[2], frames.shape[3]
+    scale = min(width / orig_w, height / orig_h, 1.0)
+    content_h, content_w = int(scale * orig_h + 0.5), int(scale * orig_w + 0.5)
+    pixels = frames.float()
+    if (content_h, content_w) != (orig_h, orig_w):
+        pixels = F.interpolate(
+            pixels,
+            size=(content_h, content_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        pixels = pixels.clamp(0, 255).round()
+    pad_bottom, pad_right = height - content_h, width - content_w
+    if pad_bottom or pad_right:
+        mode = (
+            "replicate"
+            if pad_right >= content_w or pad_bottom >= content_h
+            else "reflect"
+        )
+        pixels = F.pad(pixels, (0, pad_right, 0, pad_bottom), mode=mode)
+    return pixels, (content_h, content_w)
+
+
 def _pil_to_uint8_tensor(image: PIL.Image.Image) -> torch.Tensor:
     arr = np.asarray(image, dtype=np.uint8).copy()
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
@@ -429,12 +463,22 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             tensors: list[torch.Tensor] = []
             for src in image_sources:
                 pixels = _pil_to_uint8_tensor(load_image(src).convert("RGB"))
-                pixels = _resize_center_crop(
-                    pixels.unsqueeze(0).float(), height=target_h, width=target_w
-                )
-                # The official image path quantizes back to uint8 before scaling.
-                pixels = pixels[0].round().clamp(0, 255)
-                tensors.append(pixels / 127.5 - 1.0)
+                if batch.data_type == DataType.ACTION:
+                    pixels, content_hw = _fit_and_pad_action_frames(
+                        pixels.unsqueeze(0), height=target_h, width=target_w
+                    )
+                    if batch.extra.setdefault("action_content_hw", content_hw) != content_hw:
+                        raise ValueError(
+                            "Cosmos3 batched action images must share one aspect "
+                            "ratio: their content regions share one latent grid"
+                        )
+                else:
+                    pixels = _resize_center_crop(
+                        pixels.unsqueeze(0).float(), height=target_h, width=target_w
+                    )
+                    # The official image path quantizes back to uint8 before scaling.
+                    pixels = pixels.round().clamp(0, 255)
+                tensors.append(pixels[0] / 127.5 - 1.0)
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
             self.log_info(
                 f"Preprocessed {len(tensors)} conditioning image(s) to "
@@ -474,8 +518,16 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
             pixels = torch.stack(
                 [_pil_to_uint8_tensor(f.convert("RGB")) for f in frames]
-            ).float()
-            pixels = _resize_center_crop(pixels, height=target_h, width=target_w)
+            )
+            if batch.data_type == DataType.ACTION:
+                pixels, content_hw = _fit_and_pad_action_frames(
+                    pixels, height=target_h, width=target_w
+                )
+                batch.extra["action_content_hw"] = content_hw
+            else:
+                pixels = _resize_center_crop(
+                    pixels.float(), height=target_h, width=target_w
+                )
             # [T, 3, H, W] -> [1, 3, T, H, W]; the official video path keeps floats.
             video_tensor = (
                 (pixels / 127.5 - 1.0).permute(1, 0, 2, 3).unsqueeze(0).contiguous()
@@ -769,8 +821,12 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         )
         num_channels_latents = self.transformer.latent_channel
         num_latent_frames = (pixel_num_frames - 1) // vae_scale_factor_temporal + 1
-        height_latent = batch.height // vae_scale_factor_spatial
-        width_latent = batch.width // vae_scale_factor_spatial
+        # Action inputs are padded onto the canvas; only their content is denoised.
+        content_h, content_w = batch.extra.get(
+            "action_content_hw", (batch.height, batch.width)
+        )
+        height_latent = content_h // vae_scale_factor_spatial
+        width_latent = content_w // vae_scale_factor_spatial
 
         if batch.preprocessed_image is not None:
             batch_dim = int(batch.preprocessed_image.shape[0])
@@ -825,6 +881,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             with self.use_declared_component(component_name="vae", module=self.vae):
                 with torch.no_grad():
                     cond_latent = self._vae_encode(pixel_input).to(dtype)
+            cond_latent = cond_latent[..., :height_latent, :width_latent]
 
             max_idx = max(cond_indexes)
             if max_idx >= num_latent_frames:

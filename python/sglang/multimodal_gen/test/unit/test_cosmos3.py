@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TimestepPreparationStage,
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
+    _fit_and_pad_action_frames,
     _pad_transfer_frames,
     _request_generator,
     _resize_center_crop_uint8_cthw,
@@ -1333,6 +1334,29 @@ class TestCosmos3Transfer(unittest.TestCase):
         padded = _pad_transfer_frames(frames, 5)
         self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
 
+    def test_action_canvas_matches_official_reflection_pad(self):
+        # cosmos-framework action inputs: fit inside the canvas (bicubic on uint8,
+        # no upscale), then pad bottom/right by reflection, or edge past the content.
+        import torchvision.transforms.functional as TF
+
+        for (src_h, src_w), content_hw in (((9, 14), (5, 8)), ((4, 20), (2, 8))):
+            with self.subTest(src=(src_h, src_w)):
+                frames = torch.randint(
+                    0, 256, (2, 3, src_h, src_w), generator=torch.Generator().manual_seed(0)
+                ).to(torch.uint8)
+                actual, got_hw = _fit_and_pad_action_frames(frames, height=8, width=8)
+                resized = TF.resize(
+                    frames,
+                    list(content_hw),
+                    interpolation=TF.InterpolationMode.BICUBIC,
+                    antialias=True,
+                )
+                pad = [0, 0, 8 - content_hw[1], 8 - content_hw[0]]
+                edge = pad[2] >= content_hw[1] or pad[3] >= content_hw[0]
+                expected = TF.pad(resized, pad, padding_mode="edge" if edge else "reflect")
+                self.assertEqual(got_hw, content_hw)
+                self.assertTrue(torch.equal(actual, expected.float()))
+
     def test_resize_matches_official_torchvision_recipe(self):
         # cosmos-framework resizes every input with torchvision resize (antialiased
         # bilinear) + center_crop; downscaling and odd crop offsets expose both.
@@ -1860,6 +1884,7 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
             data_type=data_type,
             sampling_params=types.SimpleNamespace(action_mode=action_mode),
             preprocessed_image=None,
+            extra={},
         )
 
         def fake_load_image(path):
