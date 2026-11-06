@@ -12,6 +12,7 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -74,9 +75,14 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+# Prose metadata templates of the official inference defaults (sample_args.json).
 COSMOS3_DURATION_TEMPLATE = (
-    "The video is {duration:.1f} seconds long and is of {fps} FPS."
+    "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 )
+COSMOS3_VIDEO_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
+# Every official canvas is closest to one of these nominal ratios (832x480 is 16,9).
+COSMOS3_ASPECT_RATIOS = ((1, 1), (4, 3), (3, 4), (16, 9), (9, 16))
 COSMOS3_VIDEO_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
@@ -112,14 +118,50 @@ def _inject_caption_metadata(
     if not isinstance(caption, dict):
         return None
 
-    caption["resolution"] = {"H": int(height), "W": int(width)}
+    # Key order is the official dict.update order; it decides the dumped text.
     if num_frames > 1:
         caption["duration"] = f"{int(num_frames / fps) if fps > 0 else 0}s"
         caption["fps"] = float(fps)
     else:
         caption.pop("duration", None)
         caption.pop("fps", None)
+    caption["resolution"] = {"H": int(height), "W": int(width)}
+    caption["aspect_ratio"] = _aspect_ratio_label(height, width)
     return json.dumps(caption)
+
+
+def _aspect_ratio_label(height: int, width: int) -> str:
+    """The official ``aspect_ratio`` label ("16,9") of a ``width x height`` canvas."""
+    ratio = math.log(width / height)
+    across, down = min(
+        COSMOS3_ASPECT_RATIOS, key=lambda r: abs(math.log(r[0] / r[1]) - ratio)
+    )
+    return f"{across},{down}"
+
+
+def _append_prose_metadata(
+    text: str, num_frames: int, fps: float, height: int, width: int, is_image: bool
+) -> str:
+    """Append the official duration and resolution sentences to a prose prompt."""
+    text = text.strip()
+    if num_frames > 1:
+        duration = COSMOS3_DURATION_TEMPLATE.format(duration=num_frames / fps, fps=fps)
+        text = text.rstrip(".") + ". " + duration
+    template = (
+        COSMOS3_IMAGE_RESOLUTION_TEMPLATE
+        if is_image
+        else COSMOS3_VIDEO_RESOLUTION_TEMPLATE
+    )
+    resolution = template.format(height=height, width=width)
+    return text.strip().rstrip(".") + ". " + resolution
+
+
+def _map_prompts(
+    prompts: str | list[str], render: Callable[[str], str]
+) -> str | list[str]:
+    if isinstance(prompts, list):
+        return [render(text) for text in prompts]
+    return render(prompts)
 
 
 def _resize_crop_pil(
@@ -607,16 +649,22 @@ class Cosmos3TokenizationStage(PipelineStage):
                 prompt = structured_caption
                 use_duration_template = False
 
-        # Apply duration template if enabled (no temporal concept for T2I).
-        if use_duration_template and not is_image_gen and num_frames > 1:
-            duration = num_frames / fps
-            suffix = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=fps)
-            prompt = f"{prompt} {suffix}"
-            self.log_info(f"Prompt with duration: '{prompt}'")
+        def with_metadata(text: str) -> str:
+            return _append_prose_metadata(
+                text, num_frames, fps, batch.height, batch.width, is_image_gen
+            )
 
-        # Tokenize prompts
+        if use_duration_template:
+            prompt = _map_prompts(prompt, with_metadata)
+            self.log_info(f"Prompt with metadata: '{prompt}'")
+
         if isinstance(prompt, list) and not isinstance(negative_prompt, list):
             negative_prompt = [negative_prompt] * len(prompt)
+        # The official negative always carries the prose metadata, JSON or not
+        # (negative_metadata_mode "same"); an empty one keeps no leading ".".
+        negative_prompt = _map_prompts(
+            negative_prompt, lambda text: with_metadata(text).lstrip(".").strip()
+        )
 
         cond_ids, cond_mask, cond_seq_len = self._tokenize_prompt(
             prompt, max_sequence_length, device, use_system_prompt, system_prompt

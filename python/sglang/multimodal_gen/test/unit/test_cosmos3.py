@@ -2024,12 +2024,21 @@ class TestCosmos3CaptionMetadata(unittest.TestCase):
 class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     """A structured caption must not also get the prose duration suffix."""
 
-    def _run_prompt_stage(self, prompt: str, use_duration_template: bool) -> str:
-        """Drive Cosmos3TokenizationStage.forward far enough to see the prompt."""
-        seen = {}
+    def _run_prompt_stage(
+        self,
+        prompt: str,
+        use_duration_template: bool,
+        negative_prompt: str = "bad",
+        num_frames: int = 189,
+        height: int = 480,
+        width: int = 832,
+        data_type: DataType = DataType.VIDEO,
+    ) -> tuple[str, str]:
+        """Drive Cosmos3TokenizationStage.forward far enough to see both prompts."""
+        seen = []
 
         def fake_tokenize(prompt_text, *args, **kwargs):
-            seen.setdefault("prompt", prompt_text)
+            seen.append(prompt_text)
             return (
                 torch.zeros(1, 4, dtype=torch.long),
                 torch.ones(1, 4, dtype=torch.long),
@@ -2039,15 +2048,15 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
         stage = Cosmos3TokenizationStage.__new__(Cosmos3TokenizationStage)
         batch = types.SimpleNamespace(
             prompt=prompt,
-            negative_prompt="bad",
+            negative_prompt=negative_prompt,
             max_sequence_length=512,
             use_duration_template=use_duration_template,
             use_system_prompt=False,
             fps=24.0,
-            num_frames=189,
-            height=480,
-            width=832,
-            data_type=DataType.VIDEO,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            data_type=data_type,
             sampling_params=types.SimpleNamespace(action_mode=None),
             extra={},
         )
@@ -2061,18 +2070,61 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
             mock.patch.object(stage, "log_info"),
         ):
             stage.forward(batch, server_args)
-        return seen["prompt"]
+        return seen[0], seen[1]
 
     def test_structured_caption_stays_valid_json(self):
         prompt = json.dumps({"temporal_caption": "a cone melts"})
-        final = self._run_prompt_stage(prompt, use_duration_template=True)
+        final, _ = self._run_prompt_stage(prompt, use_duration_template=True)
         caption = json.loads(final)  # would raise if the suffix were appended
         self.assertEqual(caption["duration"], "7s")
         self.assertNotIn("seconds long", final)
 
     def test_prose_prompt_still_gets_the_duration_suffix(self):
-        final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
+        final, _ = self._run_prompt_stage(
+            "A curious raccoon.", use_duration_template=True
+        )
         self.assertIn("seconds long", final)
+
+    def test_prompts_match_official_templates(self):
+        # Expected strings rendered by cosmos-framework 4155d61 inference.py.
+        cases = (
+            (
+                dict(prompt="A curious raccoon.", negative_prompt="bad"),
+                "A curious raccoon. The video is 7.9 seconds long and is of 24 FPS."
+                " This video is of 480x832 resolution.",
+                "bad. The video is 7.9 seconds long and is of 24 FPS."
+                " This video is of 480x832 resolution.",
+            ),
+            (
+                dict(
+                    prompt=json.dumps({"a": 1}),
+                    negative_prompt=json.dumps({"a": "blurry"}),
+                    num_frames=81,
+                    height=720,
+                    width=1280,
+                ),
+                '{"a": 1, "duration": "3s", "fps": 24.0,'
+                ' "resolution": {"H": 720, "W": 1280}, "aspect_ratio": "16,9"}',
+                '{"a": "blurry"}. The video is 3.4 seconds long and is of 24 FPS.'
+                " This video is of 720x1280 resolution.",
+            ),
+            (
+                dict(
+                    prompt=json.dumps({"a": 1, "duration": "5s"}),
+                    negative_prompt="",
+                    num_frames=1,
+                    height=640,
+                    width=640,
+                    data_type=DataType.IMAGE,
+                ),
+                '{"a": 1, "resolution": {"H": 640, "W": 640}, "aspect_ratio": "1,1"}',
+                "This image is of 640x640 resolution.",
+            ),
+        )
+        for kwargs, want_prompt, want_negative in cases:
+            with self.subTest(prompt=kwargs["prompt"]):
+                got = self._run_prompt_stage(use_duration_template=True, **kwargs)
+                self.assertEqual(got, (want_prompt, want_negative))
 
 
 if __name__ == "__main__":
