@@ -19,6 +19,7 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
+from diffusers.utils.torch_utils import randn_tensor
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -154,6 +155,21 @@ def _append_prose_metadata(
     )
     resolution = template.format(height=height, width=width)
     return text.strip().rstrip(".") + ". " + resolution
+
+
+def _request_generator(batch: Req, server_args: ServerArgs) -> torch.Generator | None:
+    """The request's seeded generator, created once on the device it asks for.
+
+    Cosmos3 does not run InputValidationStage, so this applies its rule: a request
+    or pipeline ``generator_device`` of "cpu" keeps the draws on the host.
+    """
+    if batch.generator is None and batch.seed is not None:
+        generator_device = (
+            batch.generator_device or server_args.pipeline_config.generator_device
+        )
+        device = "cpu" if generator_device == "cpu" else get_local_torch_device()
+        batch.generator = torch.Generator(device=device).manual_seed(batch.seed)
+    return batch.generator
 
 
 def _map_prompts(
@@ -786,13 +802,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             self.log_info(f"Prepared transfer latent shape {shape}")
             return batch
 
-        generator = batch.generator
-        if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(batch.seed)
-            # The rollout SDE step draws its variance noise from this generator.
-            batch.generator = generator
-
-        noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        # The rollout SDE step draws its variance noise from this generator too.
+        generator = _request_generator(batch, server_args)
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
         uses_visual_latents = batch.data_type in (DataType.VIDEO, DataType.ACTION)
         has_image_cond = batch.preprocessed_image is not None and uses_visual_latents
@@ -867,7 +879,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             sound_latent_fps = self.transformer.sound_latent_fps
             sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
             sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
-            batch.audio_latents = torch.randn(
+            batch.audio_latents = randn_tensor(
                 sound_shape, generator=generator, device=device, dtype=dtype
             )
             self.log_info(f"Prepared sound latents with shape {sound_shape}")
@@ -1005,10 +1017,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         if mode == ACTION_MODE_FORWARD_DYNAMICS:
             condition_mask[:] = 1.0
 
-        noise = torch.randn(
-            batch_dim,
-            action_chunk_size,
-            action_dim,
+        noise = randn_tensor(
+            (batch_dim, action_chunk_size, action_dim),
             generator=generator,
             device=device,
             dtype=dtype,
@@ -1406,7 +1416,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             for control in control_norms
         ]
         condition_latents = self._encode_transfer_video(target_norm, latent_dtype)
-        noise = torch.randn(
+        noise = randn_tensor(
             condition_latents.shape,
             generator=generator,
             device=device,
@@ -1441,10 +1451,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.vae is None:
             raise RuntimeError("Cosmos3 Transfer denoising requires the pipeline VAE")
 
-        device = batch.latents.device
-        generator = batch.generator
-        if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(batch.seed)
+        generator = _request_generator(batch, server_args)
 
         plan = batch.extra["transfer_plan"]
         output_chunks = []
@@ -1516,9 +1523,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # is identical on every sequence-parallel rank; otherwise each rank draws
         # its own noise and the sharded latents diverge at the shard boundary.
         if generator is None:
-            generator = batch.generator
-        if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
+            generator = _request_generator(batch, server_args)
 
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]

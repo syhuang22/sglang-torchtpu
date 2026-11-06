@@ -68,6 +68,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
     _pad_transfer_frames,
+    _request_generator,
     _resize_center_crop_uint8_cthw,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
@@ -2019,6 +2020,29 @@ class TestCosmos3CaptionMetadata(unittest.TestCase):
                         prompt, num_frames=81, fps=24.0, height=480, width=832
                     )
                 )
+
+
+class TestCosmos3RequestGenerator(unittest.TestCase):
+    """generator_device="cpu" keeps Cosmos3's noise draws on the host."""
+
+    def test_cpu_generator_device_skips_the_accelerator(self):
+        batch = types.SimpleNamespace(generator=None, seed=7, generator_device="cpu")
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(generator_device=None)
+        )
+        stages = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3"
+        with mock.patch(
+            f"{stages}.get_local_torch_device",
+            side_effect=AssertionError("built an accelerator generator"),
+        ):
+            generator = _request_generator(batch, server_args)
+        self.assertEqual(generator.device.type, "cpu")
+        self.assertTrue(
+            torch.equal(
+                torch.randn(4, generator=generator),
+                torch.randn(4, generator=torch.Generator().manual_seed(7)),
+            )
+        )
 
 
 class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
