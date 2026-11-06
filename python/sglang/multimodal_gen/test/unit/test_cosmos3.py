@@ -9,6 +9,7 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -2067,11 +2068,51 @@ class TestCosmos3SoundLatentLength(unittest.TestCase):
         # cosmos-framework 4155d61: ceil(int(frames / fps * 48000) / 1920).
         for num_frames, want in ((41, 43), (81, 85), (121, 127), (189, 197)):
             with self.subTest(num_frames=num_frames):
-                batch = types.SimpleNamespace(sound_duration=num_frames / 24.0)
+                batch = types.SimpleNamespace(
+                    sound_duration=num_frames / 24.0,
+                    sampling_params=types.SimpleNamespace(sound_path=None),
+                )
                 stage._prepare_sound_latents(
                     batch, None, torch.device("cpu"), torch.float32
                 )
                 self.assertEqual(tuple(batch.audio_latents.shape), (1, 64, want))
+
+
+class TestCosmos3GivenSoundLatents(unittest.TestCase):
+    """ts2v: whole-hop sound latents are the clean clip, the padded last one is generated."""
+
+    def test_given_clip_conditions_whole_hops_only(self):
+        import tempfile
+
+        import soundfile
+
+        tokenizer = types.SimpleNamespace(
+            sample_rate=48000,
+            hop_size=1920,
+            audio_channels=2,
+            get_encoded_latent_num_samples=lambda n: -(-n // 1920),
+            encode=lambda wave: torch.ones(1, 64, -(-wave.shape[-1] // 1920)),
+        )
+        stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        stage.transformer = types.SimpleNamespace(sound_gen=True, sound_dim=64)
+        stage.sound_tokenizer = tokenizer
+        stage.log_info = lambda *a, **k: None
+        stage.use_declared_component = mock.MagicMock()
+        stage.use_declared_component.return_value.__enter__.return_value = tokenizer
+        with tempfile.NamedTemporaryFile(suffix=".wav") as clip:
+            soundfile.write(clip.name, np.zeros((24000, 1), dtype="float32"), 24000)
+            batch = types.SimpleNamespace(
+                sound_duration=0.0,
+                num_frames=9,
+                fps=24.0,
+                extra={},
+                sampling_params=types.SimpleNamespace(sound_path=clip.name),
+            )
+            stage._prepare_sound_latents(batch, None, torch.device("cpu"), torch.float32)
+        # 9 frames at 24 fps = 18000 samples: 9 whole hops plus a padded tenth latent.
+        mask = batch.extra["sound_velocity_mask"]
+        self.assertEqual(mask.flatten().tolist(), [0.0] * 9 + [1.0])
+        self.assertTrue(torch.equal(batch.audio_latents[..., :9], torch.ones(1, 64, 9)))
 
 
 class TestCosmos3RequestGenerator(unittest.TestCase):

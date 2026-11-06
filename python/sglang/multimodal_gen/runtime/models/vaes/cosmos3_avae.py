@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decoder-only audio tokenizer for the Cosmos3 sound modality."""
+"""Audio tokenizer (spectrogram ConvNeXt encoder, Oobleck decoder) for Cosmos3 sound."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils import weight_norm
 
@@ -124,6 +125,115 @@ class OobleckDecoder(nn.Module):
         return self.conv2(x)
 
 
+class _FP32LayerNorm(nn.LayerNorm):
+    """LayerNorm computed in fp32 whatever the module dtype, as the checkpoint was trained."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = None if self.weight is None else self.weight.float()
+        bias = None if self.bias is None else self.bias.float()
+        return F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps
+        ).to(x.dtype)
+
+
+class Cosmos3AudioConvNeXtBlock(nn.Module):
+    def __init__(self, dim: int, use_snake: bool) -> None:
+        super().__init__()
+        self.dwconv = nn.Sequential(
+            nn.ConstantPad1d((3, 3), 0),
+            nn.Conv1d(dim, dim, kernel_size=7, groups=dim),
+        )
+        self.norm = _FP32LayerNorm(dim, eps=1e-5, bias=False)
+        self.pwconv1 = nn.Conv1d(dim, dim * 4, kernel_size=1)
+        self.act = Snake1d(dim * 4) if use_snake else nn.GELU()
+        self.pwconv2 = nn.Conv1d(dim * 4, dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.dwconv(x)
+        y = self.norm(y.transpose(1, 2)).transpose(1, 2)
+        y = self.pwconv2(self.act(self.pwconv1(y)))
+        return x + y
+
+
+class Cosmos3AudioSpectrogramEncoder(nn.Module):
+    """Waveform -> VAE moments: STFT features through strided ConvNeXt stages."""
+
+    def __init__(
+        self,
+        audio_channels: int,
+        channels: int,
+        latent_dim: int,
+        channel_multiples: list[int],
+        strides: list[int],
+        num_blocks: int,
+        n_fft: int,
+        hop_length: int,
+        use_snake: bool,
+        padding_mode: str,
+    ) -> None:
+        super().__init__()
+        self.audio_channels = audio_channels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        mults = list(channel_multiples)
+        # Real and imaginary parts of n_fft // 2 + 1 bins per channel.
+        layers: list[nn.Module] = [
+            weight_norm(
+                nn.Conv1d(
+                    (n_fft + 2) * audio_channels,
+                    mults[0] * channels,
+                    kernel_size=1,
+                    bias=False,
+                )
+            )
+        ]
+        for i, stride in enumerate(strides):
+            in_dim = mults[i] * channels
+            out_dim = mults[min(i + 1, len(mults) - 1)] * channels
+            layers += [Cosmos3AudioConvNeXtBlock(in_dim, use_snake) for _ in range(num_blocks)]
+            layers.append(
+                weight_norm(
+                    nn.Conv1d(
+                        in_dim,
+                        out_dim,
+                        kernel_size=2 * stride,
+                        stride=stride,
+                        padding=math.ceil(stride / 2),
+                        padding_mode=padding_mode,
+                    )
+                )
+            )
+        layers.append(
+            weight_norm(
+                nn.Conv1d(mults[-1] * channels, latent_dim, kernel_size=1, bias=False)
+            )
+        )
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        batch, num_channels, num_samples = audio.shape
+        pad = self.n_fft - self.hop_length
+        waveform = F.pad(
+            audio.reshape(batch * num_channels, num_samples).float(),
+            (pad // 2, pad - pad // 2),
+        )
+        window = torch.hann_window(self.n_fft, device=audio.device)
+        spec = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=window,
+            center=False,
+            onesided=True,
+            return_complex=True,
+        )
+        # [B*C, F, T] complex -> [B, C * 2F, T]: per channel, real bins then imaginary.
+        spec = torch.cat([spec.real, spec.imag], dim=1).to(audio.dtype)
+        spec = spec.reshape(batch, num_channels * spec.shape[1], spec.shape[2])
+        return self.layers(spec)
+
+
 def _cfg(config: dict[str, Any], *keys: str, default: Any = None) -> Any:
     for k in keys:
         v = config.get(k)
@@ -179,6 +289,21 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
         self.tanh_output_scale = float(_cfg(config, "tanh_output_scale", default=3.5))
         self.tanh_clamp = float(_cfg(config, "tanh_clamp", default=0.995))
 
+        self.normalize_volume = bool(_cfg(config, "normalize_volume", default=True))
+        stereo = bool(config.get("stereo", True))
+        self.encoder = Cosmos3AudioSpectrogramEncoder(
+            audio_channels=int(_cfg(config, "input_channels", default=1)) * (2 if stereo else 1),
+            channels=int(_cfg(config, "enc_dim", default=192)),
+            latent_dim=int(_cfg(config, "enc_latent_dim", default=128)),
+            channel_multiples=list(_cfg(config, "enc_c_mults", default=[1, 2, 4])),
+            strides=list(_cfg(config, "enc_strides", default=[4, 5, 6])),
+            num_blocks=int(_cfg(config, "enc_num_blocks", default=2)),
+            n_fft=int(_cfg(config, "enc_n_fft", default=64)),
+            hop_length=int(_cfg(config, "enc_hop_length", default=16)),
+            use_snake=bool(_cfg(config, "enc_use_snake", default=True)),
+            padding_mode=str(_cfg(config, "padding_mode", default="zeros")),
+        )
+
         self.decoder = OobleckDecoder(
             channels=int(_cfg(config, "dec_dim", default=320)),
             input_channels=self.latent_channels,
@@ -217,6 +342,22 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
                 f"Unsupported AVAE normalization_type={self.normalization_type!r}."
             )
         return latent
+
+    @torch.no_grad()
+    def encode(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Waveform ``[B, C, N]`` -> posterior-mean latents ``[B, latent_channels, ceil(N / hop)]``."""
+        if self.normalization_type != "none":
+            raise NotImplementedError(
+                f"encoding with AVAE normalization_type={self.normalization_type!r}"
+            )
+        if self.normalize_volume:
+            waveform = waveform / (waveform.abs().max() + 1e-5) * 0.95
+        pad = -waveform.shape[-1] % self.hop_size
+        waveform = F.pad(waveform, (0, pad))
+        encoder = next(self.encoder.parameters())
+        moments = self.encoder(waveform.to(device=encoder.device, dtype=encoder.dtype))
+        # The VAE bottleneck stores [mean, scale] on the channel axis.
+        return moments[:, : self.latent_channels]
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:

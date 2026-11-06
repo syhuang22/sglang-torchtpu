@@ -1498,6 +1498,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
         sound_latents: torch.Tensor | None = None,
+        sound_noisy_mask: torch.Tensor | None = None,
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
@@ -1531,6 +1532,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             action_noisy_mask: [B, T_action, 1] where 1=noisy, 0=conditioned;
                 controls which action tokens receive the timestep embedding.
                 ``None`` means all tokens are noisy.
+            sound_noisy_mask: [B, T_sound, 1], the same for sound tokens (ts2v).
             action_fps: Frame rate for action token temporal mRoPE scaling.
                 Defaults to the video fps when None.
             action_start_frame_offset: Temporal offset applied to action
@@ -1706,7 +1708,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_sound = hidden_sound + self.audio_modality_embed.to(
                     hidden_sound.dtype
                 )
-                hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+                if sound_noisy_mask is None:
+                    hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+                else:
+                    hidden_sound = hidden_sound + time_embed.unsqueeze(
+                        1
+                    ) * sound_noisy_mask.to(hidden_sound.dtype)
                 hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
 
             seq_len_orig = hidden_gen.shape[1]

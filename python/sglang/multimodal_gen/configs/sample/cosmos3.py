@@ -88,6 +88,8 @@ class Cosmos3SamplingParams(SamplingParams):
     use_system_prompt: bool | None = None
     use_guardrails: bool | None = None
     sound_duration: float = 0.0
+    # ts2v / is2v: an audio file whose clip conditions the video (clean sound tokens).
+    sound_path: str | None = None
 
     # Optional CFG window — T2I requests typically pass e.g. ``(400, 1000)`` to
     # skip guidance at low noise levels. T2V / I2V / V2V leave it unset.
@@ -233,6 +235,7 @@ class Cosmos3SamplingParams(SamplingParams):
                 "show_control_condition",
                 "show_input",
                 "sound_duration",
+                "sound_path",
             }
         )
 
@@ -470,7 +473,7 @@ class Cosmos3SamplingParams(SamplingParams):
                 raise ValueError(
                     "Cosmos3 transfer cannot be combined with action generation"
                 )
-            if float(self.sound_duration or 0.0) > 0.0:
+            if float(self.sound_duration or 0.0) > 0.0 or self.sound_path:
                 raise ValueError(
                     "Cosmos3 transfer cannot be combined with sound generation"
                 )
@@ -488,6 +491,13 @@ class Cosmos3SamplingParams(SamplingParams):
 
     def _validate(self) -> None:
         super()._validate()
+        if self.sound_path and float(self.sound_duration or 0.0) > 0.0:
+            raise ValueError(
+                "sound_path conditions the video on given sound and sound_duration "
+                "generates sound; set one of them"
+            )
+        if self.sound_path and self.action_mode is not None:
+            raise ValueError("Cosmos3 action modes cannot be conditioned on sound")
         paths = self._resolve_control_paths()
         hints = self._resolve_control_hints()
         if hints and len(hints) != len(paths):

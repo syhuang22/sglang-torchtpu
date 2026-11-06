@@ -157,6 +157,38 @@ def _append_prose_metadata(
     return text.strip().rstrip(".") + ". " + resolution
 
 
+def _load_conditioning_audio(
+    path: str, sample_rate: int, audio_channels: int, num_samples: int
+) -> torch.Tensor:
+    """The official ts2v clip: ``[1, C, num_samples]`` float32 at ``sample_rate``.
+
+    Resamples with a polyphase filter, duplicates mono to stereo (or averages
+    stereo to mono), then trims or zero-pads to the video's duration.
+    """
+    import scipy.signal
+    import soundfile
+
+    data, source_rate = soundfile.read(path, dtype="float32", always_2d=True)
+    waveform = data.T  # [N, C] -> [C, N]
+    if source_rate != sample_rate:
+        common = math.gcd(int(source_rate), int(sample_rate))
+        waveform = scipy.signal.resample_poly(
+            waveform, sample_rate // common, source_rate // common, axis=-1
+        ).astype("float32")
+    waveform = torch.from_numpy(np.ascontiguousarray(waveform))
+    if waveform.shape[0] != audio_channels:
+        if waveform.shape[0] == 1 and audio_channels == 2:
+            waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] == 2 and audio_channels == 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        else:
+            raise ValueError(
+                f"cannot convert {waveform.shape[0]}-channel audio to {audio_channels}"
+            )
+    waveform = F.pad(waveform[:, :num_samples], (0, max(0, num_samples - waveform.shape[1])))
+    return waveform.unsqueeze(0)
+
+
 def _request_generator(batch: Req, server_args: ServerArgs) -> torch.Generator | None:
     """The request's seeded generator, created once on the device it asks for.
 
@@ -938,7 +970,12 @@ class Cosmos3LatentPreparationStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        return [ComponentUse(self._component_stage_name(stage_name), "vae")]
+        stage_name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(stage_name, "vae")]
+        if self.sound_tokenizer is not None:
+            # ts2v / is2v encode the given clip here.
+            uses.append(ComponentUse(stage_name, "sound_tokenizer"))
+        return uses
 
     @staticmethod
     def _resolve_domain_id(batch: Req) -> int:
@@ -966,26 +1003,43 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         self, batch: Req, generator, device: torch.device, dtype: torch.dtype
     ) -> None:
         sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
-        if sound_duration <= 0.0:
+        sound_path = getattr(batch.sampling_params, "sound_path", None)
+        if sound_duration <= 0.0 and not sound_path:
             return
         if not getattr(self.transformer, "sound_gen", False):
             raise ValueError(
-                "sound generation was requested (sound_duration > 0) but the "
-                "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
-                "False)."
+                "sound was requested but the loaded Cosmos3 checkpoint has no "
+                "sound modality (sound_gen is False)."
             )
         if self.sound_tokenizer is None:
-            raise ValueError("sound generation needs the checkpoint's sound tokenizer")
-        # The official placeholder clip: whole samples, then the encoder's hop padding.
-        num_samples = int(sound_duration * self.sound_tokenizer.sample_rate)
-        sound_latent_frames = max(
-            1, self.sound_tokenizer.get_encoded_latent_num_samples(num_samples)
-        )
+            raise ValueError("Cosmos3 sound needs the checkpoint's sound tokenizer")
+        tokenizer = self.sound_tokenizer
+        if sound_path:
+            # A given clip spans the video, like the official ts2v / is2v input.
+            sound_duration = batch.num_frames / batch.fps
+        # Whole samples, then the encoder's hop padding (the official placeholder clip).
+        num_samples = int(sound_duration * tokenizer.sample_rate)
+        sound_latent_frames = max(1, tokenizer.get_encoded_latent_num_samples(num_samples))
         sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
-        batch.audio_latents = randn_tensor(
-            sound_shape, generator=generator, device=device, dtype=dtype
+        noise = randn_tensor(sound_shape, generator=generator, device=device, dtype=dtype)
+        if not sound_path:
+            batch.audio_latents = noise
+            self.log_info(f"Prepared sound latents with shape {sound_shape}")
+            return
+        waveform = _load_conditioning_audio(
+            sound_path, tokenizer.sample_rate, tokenizer.audio_channels, num_samples
         )
-        self.log_info(f"Prepared sound latents with shape {sound_shape}")
+        with self.use_declared_component(
+            component_name="sound_tokenizer", module=tokenizer
+        ) as sound_tokenizer:
+            clean = sound_tokenizer.encode(waveform).to(device=device, dtype=dtype)
+        # Only whole hops are clean: the padded last latent is generated, as officially.
+        condition_mask = torch.zeros(1, 1, sound_latent_frames, device=device, dtype=dtype)
+        condition_mask[..., : num_samples // tokenizer.hop_size] = 1.0
+        batch.audio_latents = condition_mask * clean + (1.0 - condition_mask) * noise
+        batch.extra["sound_condition_latents"] = clean
+        batch.extra["sound_velocity_mask"] = 1.0 - condition_mask
+        self.log_info(f"Prepared conditioning sound latents with shape {sound_shape}")
 
     def _prepare_action_latents(
         self,
@@ -1306,6 +1360,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        sound_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
         control_latents: list[torch.Tensor] | None = None,
@@ -1340,6 +1395,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 action_latents=action_latents,
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=action_noisy_mask,
+                sound_noisy_mask=sound_noisy_mask,
                 action_fps=action_fps,
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=control_latents,
@@ -1566,6 +1622,12 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_domain_ids = batch.extra.get("action_domain_ids")
         action_velocity_mask = batch.extra.get("action_velocity_mask")
         action_condition_latents = batch.extra.get("action_condition_latents")
+        sound_velocity_mask = batch.extra.get("sound_velocity_mask")
+        sound_condition_latents = batch.extra.get("sound_condition_latents")
+        # [B, 1, T_sound] latent mask -> the DiT's [B, T_sound, 1] token mask.
+        sound_noisy_mask = (
+            sound_velocity_mask.transpose(1, 2) if sound_velocity_mask is not None else None
+        )
         action_raw_dim = batch.extra.get("raw_action_dim")
         action_start_frame_offset = batch.extra.get("action_start_frame_offset", 1)
         action_fps = getattr(batch.sampling_params, "action_fps", None)
@@ -1738,6 +1800,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     action_latents=action_latents,
                     action_domain_ids=action_domain_ids,
                     action_noisy_mask=action_velocity_mask,
+                    sound_noisy_mask=sound_noisy_mask,
                     action_fps=action_fps,
                     action_start_frame_offset=action_start_frame_offset,
                 )
@@ -1783,6 +1846,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         action_latents=action_latents,
                         action_domain_ids=action_domain_ids,
                         action_noisy_mask=action_velocity_mask,
+                        sound_noisy_mask=sound_noisy_mask,
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
                     )
@@ -1809,6 +1873,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         action_latents=action_latents,
                         action_domain_ids=action_domain_ids,
                         action_noisy_mask=action_velocity_mask,
+                        sound_noisy_mask=sound_noisy_mask,
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
                     )
@@ -1840,6 +1905,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         action_latents=action_latents,
                         action_domain_ids=action_domain_ids,
                         action_noisy_mask=action_velocity_mask,
+                        sound_noisy_mask=sound_noisy_mask,
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
                     )
@@ -1861,6 +1927,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     action_latents=action_latents,
                     action_domain_ids=action_domain_ids,
                     action_noisy_mask=action_velocity_mask,
+                    sound_noisy_mask=sound_noisy_mask,
                     action_fps=action_fps,
                     action_start_frame_offset=action_start_frame_offset,
                     control_latents=control_latents,
@@ -1938,12 +2005,20 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     )
 
             if sound_noise_pred is not None:
+                # ts2v / is2v: keep the given sound tokens clean, as for actions.
+                if sound_velocity_mask is not None:
+                    sound_noise_pred = sound_noise_pred * sound_velocity_mask
                 sound_latents = sound_scheduler.step(
                     sound_noise_pred,
                     t,
                     sound_latents,
                     return_dict=False,
                 )[0]
+                if sound_velocity_mask is not None:
+                    sound_latents = (
+                        sound_velocity_mask * sound_latents
+                        + (1.0 - sound_velocity_mask) * sound_condition_latents
+                    )
 
             if condition_latents is not None and velocity_mask is not None:
                 latents = (
@@ -2001,6 +2076,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        sound_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -2035,6 +2111,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 action_latents=action_latents,
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=action_noisy_mask,
+                sound_noisy_mask=sound_noisy_mask,
                 action_fps=action_fps,
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
@@ -2086,6 +2163,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        sound_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -2107,6 +2185,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             "action_latents": action_latents,
             "action_domain_ids": action_domain_ids,
             "action_noisy_mask": action_noisy_mask,
+            "sound_noisy_mask": sound_noisy_mask,
             "action_fps": action_fps,
             "action_start_frame_offset": action_start_frame_offset,
             "control_latents": None,
@@ -2154,6 +2233,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         action_noisy_mask: torch.Tensor | None = None,
+        sound_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -2195,6 +2275,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if action_noisy_mask is not None
             else None
         )
+        sound_mask_b = (
+            torch.cat([sound_noisy_mask, sound_noisy_mask], dim=0)
+            if sound_noisy_mask is not None
+            else None
+        )
 
         out = self._run_transformer(
             latents=latents_b,
@@ -2211,6 +2296,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             action_latents=action_b,
             action_domain_ids=action_domain_b,
             action_noisy_mask=action_mask_b,
+            sound_noisy_mask=sound_mask_b,
             action_fps=action_fps,
             action_start_frame_offset=action_start_frame_offset,
             control_latents=None,
