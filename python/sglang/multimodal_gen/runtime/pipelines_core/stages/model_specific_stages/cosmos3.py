@@ -180,23 +180,25 @@ def _map_prompts(
     return render(prompts)
 
 
-def _resize_crop_pil(
-    image: PIL.Image.Image, target_w: int, target_h: int
-) -> PIL.Image.Image:
-    """Aspect-preserving resize then center-crop to ``target_w x target_h``."""
-    scale = max(target_w / image.width, target_h / image.height)
-    resize_w = int(np.ceil(scale * image.width))
-    resize_h = int(np.ceil(scale * image.height))
-    image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
-    left = (resize_w - target_w) // 2
-    top = (resize_h - target_h) // 2
-    return image.crop((left, top, left + target_w, top + target_h))
+def _resize_center_crop(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """The official Cosmos3 input resize of float ``[T, 3, H, W]`` pixels.
 
-
-def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
-    """PIL RGB → ``[3, H, W]`` float32 tensor in ``[-1, 1]``."""
-    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
-    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    Aspect-preserving antialiased bilinear resize, then torchvision's center crop
+    (offsets rounded half to even), as cosmos-framework applies to every input.
+    """
+    orig_h, orig_w = frames.shape[2], frames.shape[3]
+    scale = max(width / orig_w, height / orig_h)
+    resize_h, resize_w = math.ceil(scale * orig_h), math.ceil(scale * orig_w)
+    frames = F.interpolate(
+        frames,
+        size=(resize_h, resize_w),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    )
+    top = int(round((resize_h - height) / 2.0))
+    left = int(round((resize_w - width) / 2.0))
+    return frames[:, :, top : top + height, left : left + width]
 
 
 def _pil_to_uint8_tensor(image: PIL.Image.Image) -> torch.Tensor:
@@ -212,20 +214,8 @@ def _resize_center_crop_uint8_cthw(
         raise ValueError(
             f"Transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
-    orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
-    scale = max(width / orig_w, height / orig_h)
-    resize_h = int(np.ceil(scale * orig_h))
-    resize_w = int(np.ceil(scale * orig_w))
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(
-        frames_tchw,
-        size=(resize_h, resize_w),
-        mode="bilinear",
-        align_corners=False,
-    )
-    top = (resize_h - height) // 2
-    left = (resize_w - width) // 2
-    cropped = resized[:, :, top : top + height, left : left + width]
+    cropped = _resize_center_crop(frames_tchw, height=height, width=width)
     return (
         cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
     )
@@ -438,9 +428,13 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 raise ValueError("Cosmos3 I2V image list is empty")
             tensors: list[torch.Tensor] = []
             for src in image_sources:
-                image = load_image(src)
-                image = _resize_crop_pil(image, target_w, target_h)
-                tensors.append(_pil_to_normalized_tensor(image))
+                pixels = _pil_to_uint8_tensor(load_image(src).convert("RGB"))
+                pixels = _resize_center_crop(
+                    pixels.unsqueeze(0).float(), height=target_h, width=target_w
+                )
+                # The official image path quantizes back to uint8 before scaling.
+                pixels = pixels[0].round().clamp(0, 255)
+                tensors.append(pixels / 127.5 - 1.0)
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
             self.log_info(
                 f"Preprocessed {len(tensors)} conditioning image(s) to "
@@ -478,13 +472,14 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             if len(frames) < num_target_frames:
                 frames = frames + [frames[-1]] * (num_target_frames - len(frames))
 
-            processed = [
-                _pil_to_normalized_tensor(
-                    _resize_crop_pil(f.convert("RGB"), target_w, target_h)
-                )
-                for f in frames
-            ]
-            video_tensor = torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+            pixels = torch.stack(
+                [_pil_to_uint8_tensor(f.convert("RGB")) for f in frames]
+            ).float()
+            pixels = _resize_center_crop(pixels, height=target_h, width=target_w)
+            # [T, 3, H, W] -> [1, 3, T, H, W]; the official video path keeps floats.
+            video_tensor = (
+                (pixels / 127.5 - 1.0).permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+            )
             batch.preprocessed_video = video_tensor
             self.log_info(
                 f"Preprocessed conditioning video to "

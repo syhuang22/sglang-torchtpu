@@ -4,6 +4,7 @@
 import dataclasses
 import importlib.util
 import json
+import math
 import types
 import unittest
 from unittest import mock
@@ -1329,27 +1330,30 @@ class TestCosmos3Transfer(unittest.TestCase):
         padded = _pad_transfer_frames(frames, 5)
         self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
 
-    def test_transfer_resize_matches_vllm_omni(self):
-        frames = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(3, 2, 2, 3)
+    def test_resize_matches_official_torchvision_recipe(self):
+        # cosmos-framework resizes every input with torchvision resize (antialiased
+        # bilinear) + center_crop; downscaling and odd crop offsets expose both.
+        import torchvision.transforms.functional as TF
 
-        actual = _resize_center_crop_uint8_cthw(frames, height=3, width=3)
-
-        resized = torch.nn.functional.interpolate(
-            frames.permute(1, 0, 2, 3).float(),
-            size=(3, 5),
-            mode="bilinear",
-            align_corners=False,
-        )
-        expected = (
-            resized[:, :, :, 1:4]
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-        )
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertEqual(tuple(actual.shape), (3, 2, 3, 3))
+        for (src_h, src_w), (height, width) in (((2, 2), (3, 3)), ((9, 14), (3, 4))):
+            with self.subTest(src=(src_h, src_w), dst=(height, width)):
+                frames = torch.randint(
+                    0, 256, (3, 2, src_h, src_w), generator=torch.Generator().manual_seed(0)
+                ).to(torch.uint8)
+                actual = _resize_center_crop_uint8_cthw(frames, height=height, width=width)
+                scale = max(width / src_w, height / src_h)
+                resized = TF.resize(
+                    frames.permute(1, 0, 2, 3).float(),
+                    [math.ceil(scale * src_h), math.ceil(scale * src_w)],
+                )
+                expected = (
+                    TF.center_crop(resized, [height, width])
+                    .round()
+                    .clamp(0, 255)
+                    .to(torch.uint8)
+                    .permute(1, 0, 2, 3)
+                )
+                self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(actual.dtype, torch.uint8)
 
     def test_transfer_chunks_stitch_without_duplicate_overlap(self):
