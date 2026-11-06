@@ -451,6 +451,8 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             )
 
         target_h, target_w = batch.height, batch.width
+        # Every action mode, forward dynamics included, takes the official action canvas.
+        on_action_canvas = getattr(batch.sampling_params, "action_mode", None) is not None
 
         if image_path is not None:
             image_sources = (
@@ -463,7 +465,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             tensors: list[torch.Tensor] = []
             for src in image_sources:
                 pixels = _pil_to_uint8_tensor(load_image(src).convert("RGB"))
-                if batch.data_type == DataType.ACTION:
+                if on_action_canvas:
                     pixels, content_hw = _fit_and_pad_action_frames(
                         pixels.unsqueeze(0), height=target_h, width=target_w
                     )
@@ -519,7 +521,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             pixels = torch.stack(
                 [_pil_to_uint8_tensor(f.convert("RGB")) for f in frames]
             )
-            if batch.data_type == DataType.ACTION:
+            if on_action_canvas:
                 pixels, content_hw = _fit_and_pad_action_frames(
                     pixels, height=target_h, width=target_w
                 )
