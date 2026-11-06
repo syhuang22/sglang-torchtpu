@@ -633,7 +633,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             # x1 = (b1 - rk * b0) / det
             rhos_c_0 = (b[0] - b[1]) / det
             rhos_c_1 = (b[1] - rk * b[0]) / det
-            rhos_c = torch.stack([rhos_c_0, rhos_c_1])
+            rhos_c = torch.stack([rhos_c_0, rhos_c_1]).to(x.dtype)
         else:
             rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
 
