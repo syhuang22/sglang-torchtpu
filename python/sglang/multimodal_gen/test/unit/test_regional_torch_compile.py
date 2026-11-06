@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
     MOVADenoisingStage,
 )
@@ -148,6 +151,41 @@ def test_mova_uses_platform_compile_kwargs():
             "options": {"max_autotune": True},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "out_of_tree, expected",
+    [
+        (False, {"mode": "default", "fullgraph": False, "dynamic": False}),
+        (True, {"backend": "custom_backend", "fullgraph": False, "dynamic": False}),
+    ],
+)
+def test_cosmos3_gen_layers_use_platform_compile_kwargs(out_of_tree, expected):
+    """In-tree kwargs stay as they were; an out-of-tree platform picks the backend."""
+    stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+    transformer = nn.Module()
+    transformer.gen_layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+    compile_path = "sglang.multimodal_gen.runtime.utils.torch_compile"
+    calls = []
+
+    with (
+        patch(f"{compile_path}.current_platform.is_npu", return_value=False),
+        patch(
+            f"{compile_path}.current_platform.is_out_of_tree",
+            return_value=out_of_tree,
+        ),
+        patch(
+            f"{compile_path}.current_platform.get_compile_backend",
+            return_value="custom_backend",
+        ),
+        patch(f"{compile_path}.current_platform.get_compile_options", return_value=None),
+        patch("torch.compile", side_effect=lambda layer, **kw: calls.append(kw) or layer),
+    ):
+        stage._maybe_enable_torch_compile(
+            transformer, SimpleNamespace(enable_torch_compile=True)
+        )
+
+    assert calls == [expected, expected]
 
 
 def test_vae_compile_options_receive_the_target_module():

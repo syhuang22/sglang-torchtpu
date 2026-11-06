@@ -70,8 +70,8 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import resolve_torch_compile_kwargs
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
-from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -1181,32 +1181,19 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             return
 
-        if current_platform.is_npu():
-            compile_kwargs: dict[str, Any] = {
-                "backend": get_compiler_backend(),
-                "fullgraph": False,
-                "dynamic": False,
-            }
-        else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
-            # Lift Dynamo's per-callable cache cap above the default (64).
-            # Each gen_layer is its own compiled object, and several shape
-            # specializations (cond/uncond, with/without residual carry,
-            # SP on/off) can accumulate. 128 leaves headroom without
-            # encouraging unbounded specialization.
-            torch._dynamo.config.cache_size_limit = max(
-                getattr(torch._dynamo.config, "cache_size_limit", 64), 128
-            )
-            compile_kwargs = {
-                "mode": "default",
-                "fullgraph": False,
-                "dynamic": False,
-            }
+        compile_kwargs, _ = resolve_torch_compile_kwargs(
+            default="default",
+            module=transformer,
+            enable_inductor_compute_comm_overlap=True,
+        )
+        # Each request kind (cond/uncond, residual carry, SP) is its own static shape.
+        compile_kwargs["dynamic"] = False
+        # Lift Dynamo's per-callable cache cap above the default (64). Each
+        # gen_layer is its own compiled object and those shape specializations
+        # accumulate; 128 leaves headroom without encouraging unbounded ones.
+        torch._dynamo.config.cache_size_limit = max(
+            getattr(torch._dynamo.config, "cache_size_limit", 64), 128
+        )
 
         gen_layers = getattr(transformer, "gen_layers", None)
         if gen_layers is not None and isinstance(gen_layers, nn.ModuleList):
