@@ -723,10 +723,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, vae, transformer):
+    def __init__(self, vae, transformer, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
         self.transformer = transformer
+        self.sound_tokenizer = sound_tokenizer
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -863,21 +864,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         self.log_info(f"Prepared latents with shape {shape}")
 
-        sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
-        if sound_duration > 0.0:
-            if not getattr(self.transformer, "sound_gen", False):
-                raise ValueError(
-                    "sound generation was requested (sound_duration > 0) but the "
-                    "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
-                    "False)."
-                )
-            sound_latent_fps = self.transformer.sound_latent_fps
-            sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
-            sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
-            batch.audio_latents = randn_tensor(
-                sound_shape, generator=generator, device=device, dtype=dtype
-            )
-            self.log_info(f"Prepared sound latents with shape {sound_shape}")
+        self._prepare_sound_latents(batch, generator, device, dtype)
 
         action_mode = getattr(batch.sampling_params, "action_mode", None)
         if action_mode is not None:
@@ -915,6 +902,31 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         raise ValueError(
             "Cosmos3 action generation requires --domain-id or --domain-name."
         )
+
+    def _prepare_sound_latents(
+        self, batch: Req, generator, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
+        if sound_duration <= 0.0:
+            return
+        if not getattr(self.transformer, "sound_gen", False):
+            raise ValueError(
+                "sound generation was requested (sound_duration > 0) but the "
+                "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
+                "False)."
+            )
+        if self.sound_tokenizer is None:
+            raise ValueError("sound generation needs the checkpoint's sound tokenizer")
+        # The official placeholder clip: whole samples, then the encoder's hop padding.
+        num_samples = int(sound_duration * self.sound_tokenizer.sample_rate)
+        sound_latent_frames = max(
+            1, self.sound_tokenizer.get_encoded_latent_num_samples(num_samples)
+        )
+        sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
+        batch.audio_latents = randn_tensor(
+            sound_shape, generator=generator, device=device, dtype=dtype
+        )
+        self.log_info(f"Prepared sound latents with shape {sound_shape}")
 
     def _prepare_action_latents(
         self,

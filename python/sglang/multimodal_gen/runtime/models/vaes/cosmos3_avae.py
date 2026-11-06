@@ -196,6 +196,10 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
     def get_latent_num_samples(self, num_audio_samples: int) -> int:
         return int(num_audio_samples) // self.hop_size
 
+    def get_encoded_latent_num_samples(self, num_audio_samples: int) -> int:
+        """Latent length of an encoded clip; encoding pads it up to a whole hop."""
+        return -(-int(num_audio_samples) // self.hop_size)
+
     def get_audio_num_samples(self, num_latent_samples: int) -> int:
         return int(num_latent_samples) * self.hop_size
 

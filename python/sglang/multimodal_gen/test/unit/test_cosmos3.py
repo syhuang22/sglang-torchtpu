@@ -60,6 +60,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
 )
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_avae import (
+    Cosmos3AVAEAudioTokenizer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -2024,6 +2027,26 @@ class TestCosmos3CaptionMetadata(unittest.TestCase):
                         prompt, num_frames=81, fps=24.0, height=480, width=832
                     )
                 )
+
+
+class TestCosmos3SoundLatentLength(unittest.TestCase):
+    """t2vs sound latents are as many as the official placeholder clip encodes to."""
+
+    def test_matches_official_placeholder_length(self):
+        tokenizer = Cosmos3AVAEAudioTokenizer.__new__(Cosmos3AVAEAudioTokenizer)
+        tokenizer.sample_rate, tokenizer.hop_size = 48000, 1920
+        stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        stage.transformer = types.SimpleNamespace(sound_gen=True, sound_dim=64)
+        stage.sound_tokenizer = tokenizer
+        stage.log_info = lambda *a, **k: None
+        # cosmos-framework 4155d61: ceil(int(frames / fps * 48000) / 1920).
+        for num_frames, want in ((41, 43), (81, 85), (121, 127), (189, 197)):
+            with self.subTest(num_frames=num_frames):
+                batch = types.SimpleNamespace(sound_duration=num_frames / 24.0)
+                stage._prepare_sound_latents(
+                    batch, None, torch.device("cpu"), torch.float32
+                )
+                self.assertEqual(tuple(batch.audio_latents.shape), (1, 64, want))
 
 
 class TestCosmos3RequestGenerator(unittest.TestCase):

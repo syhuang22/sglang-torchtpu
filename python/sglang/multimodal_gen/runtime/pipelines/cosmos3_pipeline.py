@@ -98,7 +98,11 @@ class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
 
             self.add_stage(Cosmos3TextGuardrailStage())
-        self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
+        self.add_stage(
+            Cosmos3LatentPreparationStage(
+                vae, transformer, sound_tokenizer=sound_tokenizer
+            )
+        )
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
         self.add_stage(
             Cosmos3DenoisingStage(
