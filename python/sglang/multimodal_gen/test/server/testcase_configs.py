@@ -290,6 +290,9 @@ class DiffusionSamplingParams:
     """Configuration for a single model/scenario test case."""
 
     output_size: str = ""
+    # The output's size when the model returns other than the requested canvas;
+    # Cosmos3 action modes denoise only the picture inside a padded canvas.
+    expected_output_size: str = ""
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation

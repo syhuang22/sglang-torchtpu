@@ -61,7 +61,9 @@ def _forward_dynamics_case() -> DiffusionTestCase:
             image_path=hf_hub_download(
                 REPO, "assets/example_action_fd_agibotworld_first_frame.png"
             ),
+            # The canvas; the 720x640 frame fits it as 569x640, so 35 latent columns = 560.
             output_size="640x640",
+            expected_output_size="560x640",
             num_frames=example["action_chunk_size"] + 1,
             extras={
                 **COMMON,
@@ -69,7 +71,8 @@ def _forward_dynamics_case() -> DiffusionTestCase:
                 "domain_name": example["domain_name"],
                 "action_view_point": example["view_point"],
                 "action_fps": example["fps"],
-                "action": example["action_chunks"][0],
+                # Multipart form fields are strings; the server JSON-decodes this one.
+                "action": json.dumps(example["action_chunks"][0]),
             },
         ),
         run_perf_check=False,

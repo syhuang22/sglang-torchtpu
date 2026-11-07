@@ -1197,7 +1197,9 @@ def get_generate_fn(
             f.write(content)
 
         # Validate output file
-        expected_width, expected_height = parse_dimensions(size)
+        expected_width, expected_height = parse_dimensions(
+            sampling_params.expected_output_size or size
+        )
         if (
             extra_body is not None
             and extra_body.get("enable_upscaling")
