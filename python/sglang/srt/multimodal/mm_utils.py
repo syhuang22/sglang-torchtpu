@@ -114,7 +114,8 @@ def materialize_multimodal_features(
     offset = 0
     for feature in features:
         length = feature.shape[0]
-        output[offset : offset + length].copy_(feature, non_blocking=True)
+        # A host output is read on return, so a device-to-host copy must finish here.
+        output[offset : offset + length].copy_(feature, non_blocking=not output.is_cpu)
         offset += length
     if pad_to is not None:
         output[offset:].zero_()
