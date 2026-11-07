@@ -42,6 +42,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
+| Cosmos3-Nano (diffusion and reasoner) | bf16 | 1 host | Experimental |
 
 ### Features
 
@@ -66,7 +67,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Runtime | torch.compile with the TPU backend, compile bundles, direct tracer, overlap scheduling | Supported |
 | Runtime | Out-of-tree plugin mode, zero-recompile serving check | Experimental |
 | Multimodal | Vision-language models (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Supported |
-| Generation | Diffusion (Wan2.2) | Experimental |
+| Generation | Diffusion (Wan2.2, Cosmos3) | Experimental |
 | Serving | Prompt and input logprobs | Supported |
 | Serving | Structured output, function calling | Experimental |
 
@@ -101,6 +102,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Experimental** | Text and vision. Accuracy and perf suites registered; red at the time of writing. Moves to Supported when green. |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
+| Cosmos3-Nano (diffusion and reasoner) | bf16 | 1 host | **Experimental** | Image, video, sound and action pipelines (Ulysses + splash attention for video; actions on one core) and the reasoner on srt. External nightly only, no CI green yet. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
 ## Features
@@ -179,7 +181,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Feature | Single-host | Multi-host | Tier | Notes |
 | --- | --- | --- | --- | --- |
 | Vision-language (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Nightly (Qwen3-VL, Qwen3.5) | Nightly (Qwen3-VL PD) | **Supported** | Compiled vision encoders with shape buckets; host-side embedding scatter by default. |
-| Diffusion (Wan2.2) | Nightly (ext) | Nightly (ext, collectives) | **Experimental** | Generic diffusion engine; no TPU-specific kernels. |
+| Diffusion (Wan2.2, Cosmos3) | Nightly (ext) | Nightly (ext, collectives) | **Experimental** | Generic diffusion engine; Pallas splash attention opt-in. |
 | Prompt and input logprobs | CI (0.6B) | — | **Supported** | Env-gated. Not under DP attention or PP. |
 | Structured output / grammar | — | — | **Experimental** | Works through the eager sampler path; excluded from the spec-decode fast path. No TPU test yet. |
 | Function calling | — | — | **Experimental** | Same as structured output. |
