@@ -206,15 +206,20 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "get_video_feature",
     ):
         return False
-    return owner.__class__.__name__ in {
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-        "KimiK25ForConditionalGeneration",
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-    }
+    # Walk the MRO so subclasses (Cosmos3 is a Qwen3-VL) keep the batched path.
+    return any(
+        cls.__name__
+        in {
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "KimiK25ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+            "KimiK31ForConditionalGeneration",
+        }
+        for cls in type(owner).__mro__
+    )
 
 
 def _move_items_to_device(

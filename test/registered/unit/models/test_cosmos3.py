@@ -306,5 +306,17 @@ class TestAllowPatternsOverrides(CustomTestCase):
             )
 
 
+
+class TestCosmos3ImageFeaturePlacement(CustomTestCase):
+    """Cosmos3 is a Qwen3-VL, so it must take Qwen3-VL's image-feature path."""
+
+    def test_scheduler_leaves_pixels_to_the_encoder(self):
+        from sglang.srt.managers.mm_schedule import _can_skip_pre_embed_feature_move
+
+        model = Cosmos3ForConditionalGeneration.__new__(Cosmos3ForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        self.assertTrue(_can_skip_pre_embed_feature_move(model.get_image_feature))
+
+
 if __name__ == "__main__":
     unittest.main()
