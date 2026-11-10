@@ -59,12 +59,13 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None, extra_key=None):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        extra_key=extra_key,
     )
 
 
@@ -476,6 +477,31 @@ class TestPrefixAwareSelector(CustomTestCase):
         self.assertEqual(sel.select(turn1, [0, 0, 0], [0, 1, 2]), 0)
         self.assertEqual(sel.select(turn1 + _prompt(2, 4), [0, 0, 0], [1, 2]), 1)
 
+    def test_extra_key_keeps_prefixes_apart(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(
+            sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3], extra_key="a"), 0
+        )
+        turn2 = turn1 + _prompt(2, 4)
+        # Same tokens under another extra_key: the radix cache would not share
+        # them, so the turn goes by load instead of back to rank 0.
+        self.assertEqual(
+            sel.select(turn2, [1, 0, 0, 0], [0, 1, 2, 3], extra_key="b"), 1
+        )
+        self.assertEqual(
+            sel.select(turn2, [1, 1, 0, 0], [0, 1, 2, 3], extra_key="a"), 0
+        )
+
+    def test_low_match_tie_breaks_on_the_emptiest_index(self):
+        sel = _selector()
+        sel.index.insert(0, sel.index.block_keys(_prompt(7, 8)))
+        sel.index.insert(1, sel.index.block_keys(_prompt(8, 2)))
+        # Equal load, no match anywhere: rank 2 (empty index) beats 0 and 1.
+        self.assertEqual(sel.select(_prompt(9, 4), [0, 0, 0], [0, 1, 2]), 2)
+        # Load still comes first.
+        self.assertEqual(sel.select(_prompt(10, 4), [0, 0, 1], [0, 1, 2]), 1)
+
     def test_prompt_shorter_than_a_block_goes_by_load(self):
         sel = _selector(block_size=16)
         self.assertEqual(sel.select([1, 2, 3], [2, 0], [0, 1]), 1)
@@ -498,6 +524,14 @@ class TestPrefixAwareScheduler(CustomTestCase):
         self.assertEqual(ctl.workers[1].send_pyobj.call_count, 1)
         self.assertEqual(ctl.dp_budget.total_requests, [2, 1, 0, 0])
         self.assertEqual(ctl.dp_budget.total_tokens, [16 + 32, 16, 0, 0])
+
+    def test_passes_extra_key_to_the_selector(self):
+        ctl = self._controller()
+        turn1 = _prompt(1, 4)
+        ctl.prefix_aware_scheduler(_req(input_ids=turn1, extra_key="x"))
+        ctl.prefix_aware_scheduler(_req(input_ids=turn1 + _prompt(2, 4), extra_key="y"))
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 1)
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 1)
 
     def test_routed_dp_rank_bypasses_prefix_routing(self):
         ctl = self._controller()

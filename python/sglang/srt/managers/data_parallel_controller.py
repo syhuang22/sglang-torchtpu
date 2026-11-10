@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     publish,
 )
@@ -801,6 +802,9 @@ class DataParallelController:
 
     def _make_prefix_selector(self) -> PrefixAwareSelector:
         block_size = envs.SGLANG_DP_PREFIX_ROUTING_BLOCK_SIZE.get()
+        if block_size <= 0:
+            # One index block per radix page: a rank can only reuse whole pages.
+            block_size = max(1, int(get_schedule().page_size or 1))
         capacity_tokens = envs.SGLANG_DP_PREFIX_ROUTING_CAPACITY_TOKENS.get()
         if capacity_tokens <= 0:
             # A rank's radix cache holds at most its KV pool (plus the HiCache
@@ -835,7 +839,12 @@ class DataParallelController:
         input_ids = req.input_ids or []
         budget = self.dp_budget
         active = [r for r in self._active_workers if r < budget.num_dp_ranks]
-        target = self.prefix_selector.select(input_ids, budget.total_requests, active)
+        target = self.prefix_selector.select(
+            input_ids,
+            budget.total_requests,
+            active,
+            extra_key=getattr(req, "extra_key", None),
+        )
         # Same speculative increment as DPBudget.dispatch, until the next
         # load snapshot replaces it.
         budget.total_requests[target] += 1

@@ -34,11 +34,35 @@ two load guards borrowed from sgl-model-gateway's cache-aware policy:
   ``balance_abs_threshold`` requests *and* by more than
   ``balance_rel_threshold`` times is not a candidate;
 - a match shorter than ``cache_threshold`` of the prompt goes to the
-  least-loaded candidate instead.
+  least-loaded candidate instead, and among equally loaded ones to the rank
+  whose index holds the fewest blocks (the most room in its cache), as
+  sgl-model-gateway does with its smallest tree.
 
 The second guard keeps a system prompt shared by every session from pulling all
 new sessions to the first rank that cached it. Once each rank has cached the
 shared part, equal matches tie-break on load.
+
+Prior art in sgl-model-gateway (``sgl-model-gateway/src/policies``):
+
+- ``cache_aware.rs`` keeps an approximate radix tree per worker over raw text
+  characters, with LRU eviction by ``max_tree_size``. This index keys token
+  blocks instead: the controller already has the token ids, and a block the
+  size of the radix page matches what the rank's cache can actually reuse. Its
+  defaults (``cache_threshold`` 0.5, ``balance_abs_threshold`` 32,
+  ``balance_rel_threshold`` 1.1) are sized for whole servers; an attention-DP
+  rank runs ~8 requests, so an absolute gap of 32 would never trigger and the
+  defaults here are 0.5 / 4 / 1.5.
+- ``prefix_hash.rs`` hashes the first 256 tokens onto a consistent-hash ring.
+  Every session that shares a long system prompt hashes to the same worker, so
+  it is not used as the matching rule here.
+
+Block keys are Python hashes of int tuples, chained per block, and seeded with
+the request's ``extra_key`` so requests the radix cache keeps apart (different
+``extra_key`` / cache salt) do not match each other. They never leave the
+controller process, so the SHA-256 page hash HiCache storage uses
+(``mem_cache.utils.get_hash_str``) is not needed: measured on 200k-token
+prompts it costs ~2.1 ms per request against ~1.0 ms here, and it loads a
+JIT-built C++ extension into the controller.
 """
 
 from __future__ import annotations
@@ -66,11 +90,17 @@ class PrefixAffinityIndex:
             OrderedDict() for _ in range(num_ranks)
         ]
 
-    def block_keys(self, input_ids: Sequence[int]) -> list[int]:
-        """Chained keys of the prompt's full blocks; a partial tail is ignored."""
+    def block_keys(
+        self, input_ids: Sequence[int], extra_key: str | None = None
+    ) -> list[int]:
+        """Chained keys of the prompt's full blocks; a partial tail is ignored.
+
+        ``extra_key`` seeds the chain: the radix cache never shares a prefix
+        between requests with different ``extra_key``, so neither does this.
+        """
         bs = self.block_size
         keys = []
-        key = 0
+        key = 0 if extra_key is None else hash(("extra_key", extra_key))
         for start in range(0, len(input_ids) - bs + 1, bs):
             key = hash((key, tuple(input_ids[start : start + bs])))
             keys.append(key)
@@ -154,6 +184,7 @@ class PrefixAwareSelector:
         input_ids: Sequence[int],
         loads: Sequence[int],
         active: Sequence[int],
+        extra_key: str | None = None,
     ) -> int:
         """Return the rank for this prompt and record it in the index.
 
@@ -162,7 +193,7 @@ class PrefixAwareSelector:
         """
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
-        keys = self.index.block_keys(input_ids)
+        keys = self.index.block_keys(input_ids, extra_key)
         matched = self.index.match(keys)
         min_load = min(loads[r] for r in active)
         candidates = [r for r in active if not self._overloaded(loads[r], min_load)]
@@ -173,7 +204,12 @@ class PrefixAwareSelector:
             input_ids
         )
         if not by_prefix:
-            best = min(candidates, key=lambda r: (loads[r], -matched[r]))
+            # Least loaded; then the emptiest index (sgl-model-gateway's
+            # smallest-tree fallback), then the longer partial match.
+            best = min(
+                candidates,
+                key=lambda r: (loads[r], self.index.num_blocks(r), -matched[r]),
+            )
             matched_tokens = matched[best] * self.index.block_size
 
         self.index.insert(best, keys)
